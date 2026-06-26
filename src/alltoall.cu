@@ -4,6 +4,7 @@
  * See LICENSE.txt for license information
  ************************************************************************/
 
+#include <cassert>
 #include "cuda_runtime.h"
 #include "common.h"
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2,28,0)
@@ -83,6 +84,13 @@ testResult_t AlltoAllGetDevCommRequirements(int deviceImpl, ncclDevCommRequireme
       }
       reqs->barrierCount = deviceCtaCount;
       reqs->ginSignalCount = deviceCtaCount;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 4)
+      // These kernels use indexed counter signals, not strong legacy or VA signals.
+      reqs->ginStrongSignalsRequired = false;
+#endif
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
+      reqs->ginVaSignalsRequired = false;
+#endif
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 29, 7)
       reqs->ginConnectionType = NCCL_GIN_CONNECTION_FULL;
 #else
@@ -235,7 +243,25 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
   int ginContext = 0;
   unsigned int signalIndex = blockIdx.x;
   ncclGin gin { devComm, ginContext };
-  uint64_t signalValue = gin.readSignal(signalIndex);
+
+  /* A put from sender s to receiver R rides context (s + R) % nctx -> rail.
+   * Because the context depends on both source and destination, any rank
+   * sends across every context (as the dest r varies) and receives across
+   * every context (as the source s varies).
+   *
+   * nctx is the actual context count the comm was created with. */
+  int nctx = (int)devComm.ginContextCount;
+  assert(0 < nctx && nctx <= NCCL_GIN_MAX_CONNECTIONS);
+  /* Capture every context's signal baseline BEFORE the barrier. */
+  uint64_t signalBase[NCCL_GIN_MAX_CONNECTIONS];
+  int expected[NCCL_GIN_MAX_CONNECTIONS];
+  for (int c = 0; c < nctx; c++) {
+    ncclGin gc { devComm, c };
+    signalBase[c] = gc.readSignal(signalIndex);
+    expected[c] = 0;
+  }
+  for (int s = 0; s < devComm.nRanks; s++)
+    expected[(s + devComm.rank) % nctx]++;
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
   bar.sync(ncclCoopCta(), cuda::memory_order_acquire, ncclGinFenceLevel::Relaxed);
@@ -246,16 +272,21 @@ __global__ void GinAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, ncclW
   /* send to all peers via GIN */
   const size_t size = count * sizeof(T);
   for (int r=tid; r<devComm.nRanks; r+=nthreads) {
-    gin.put(ncclTeamWorld(devComm), r,
+    ncclGin ginc { devComm, (devComm.rank + r) % nctx };
+    ginc.put(ncclTeamWorld(devComm), r,
         recvwin, recvoffset + devComm.rank * size,
         sendwin, sendoffset + r * size,
         size, ncclGin_SignalInc{signalIndex});
   }
 
   int receivingCta = (devComm.rank % nthreads) / blockDim.x;
-  if (blockIdx.x == receivingCta)
-    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + devComm.nRanks);
-  gin.flush(ncclCoopCta());
+  /* Wait on each context for its share of inbound arrivals, then flush it. */
+  for (int c = 0; c < nctx; c++) {
+    ncclGin gc { devComm, c };
+    if (blockIdx.x == receivingCta)
+      gc.waitSignal(ncclCoopCta(), signalIndex, signalBase[c] + expected[c]);
+    gc.flush(ncclCoopCta());
+  }
 
   bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
@@ -265,7 +296,32 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
   int ginContext = 0;
   unsigned int signalIndex = blockIdx.x;
   ncclGin gin { devComm, ginContext };
-  uint64_t signalValue = gin.readSignal(signalIndex);
+
+  ncclTeam world = ncclTeamWorld(devComm);
+  ncclTeam lsa = ncclTeamLsa(devComm);
+  const int startLsa = world.rank - lsa.rank;
+  const int lsaSize  = lsa.nRanks;
+
+  /* Only remote (non-LSA) peers deliver over GIN; local peers use LSA and
+   * carry no signal. A put from sender s to receiver R rides context
+   * (s + R) % nctx -> rail (see GinAlltoAllKernel). Count this rank's
+   * inbound GIN signals per context, over remote senders only.
+   *
+   * nctx is the actual context count the comm was created with. */
+  int nctx = (int)devComm.ginContextCount;
+  assert(0 < nctx && nctx <= NCCL_GIN_MAX_CONNECTIONS);
+  /* Capture every context's signal baseline BEFORE the barrier. */
+  uint64_t signalBase[NCCL_GIN_MAX_CONNECTIONS];
+  int expected[NCCL_GIN_MAX_CONNECTIONS];
+  for (int c = 0; c < nctx; c++) {
+    ncclGin gc { devComm, c };
+    signalBase[c] = gc.readSignal(signalIndex);
+    expected[c] = 0;
+  }
+  for (int s = 0; s < world.nRanks; s++) {
+    if (s >= startLsa && s < startLsa + lsaSize) continue; /* local: LSA, no signal */
+    expected[(s + world.rank) % nctx]++;
+  }
 
   ncclBarrierSession<ncclCoopCta> bar { ncclCoopCta(), ncclTeamTagWorld(), gin, blockIdx.x };
   bar.sync(ncclCoopCta(), cuda::memory_order_acquire, ncclGinFenceLevel::Relaxed);
@@ -273,16 +329,13 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
   int tid = threadIdx.x + blockIdx.x*blockDim.x;
   int nthreads = blockDim.x * gridDim.x;
 
-  ncclTeam world = ncclTeamWorld(devComm);
-  ncclTeam lsa = ncclTeamLsa(devComm);
-  const int startLsa = world.rank - lsa.rank;
-  const int lsaSize  = lsa.nRanks;
-
-  /* handle remote peers (i.e., non-LSA) using GIN */
+  /* handle remote peers (i.e., non-LSA) using GIN; put to peer r rides
+   * context (rank + r) % nctx */
   const size_t size = count * sizeof(T);
   for (int r = tid; r < world.nRanks; r += nthreads) {
     if (r < startLsa || r >= startLsa + lsaSize) {
-      gin.put(world, r,
+      ncclGin ginc { devComm, (world.rank + r) % nctx };
+      ginc.put(world, r,
           recvwin, recvoffset + world.rank * size,
           sendwin, sendoffset + r * size,
           size, ncclGin_SignalInc{signalIndex});
@@ -299,11 +352,14 @@ __global__ void HybridAlltoAllKernel(ncclWindow_t sendwin, size_t sendoffset, nc
     }
   }
 
-  int numRemotePeers = world.nRanks - lsa.nRanks;
   int receivingCta = (world.rank % nthreads) / blockDim.x;
-  if (blockIdx.x == receivingCta)
-    gin.waitSignal(ncclCoopCta(), signalIndex, signalValue + numRemotePeers);
-  gin.flush(ncclCoopCta());
+  /* Wait on each context for its share of inbound remote arrivals, then flush it. */
+  for (int c = 0; c < nctx; c++) {
+    ncclGin gc { devComm, c };
+    if (blockIdx.x == receivingCta)
+      gc.waitSignal(ncclCoopCta(), signalIndex, signalBase[c] + expected[c]);
+    gc.flush(ncclCoopCta());
+  }
 
   bar.sync(ncclCoopCta(), cuda::memory_order_release, ncclGinFenceLevel::Relaxed);
 }
