@@ -21,7 +21,8 @@ NVLDFLAGS += -L$(NCCL_HOME)/lib
 endif
 
 ifeq ($(MPI), 1)
-NVCUFLAGS += -DMPI_SUPPORT -I$(MPI_HOME)/include
+MPI_INCLUDE ?= $(MPI_HOME)/include
+NVCUFLAGS += -DMPI_SUPPORT -I$(MPI_INCLUDE)
 NVLDFLAGS += -L$(MPI_HOME)/lib -L$(MPI_HOME)/lib64 -lmpi
 endif
 ifeq ($(MPI_IBM),1)

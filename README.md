@@ -18,6 +18,12 @@ NCCL tests rely on MPI to work on multiple processes, hence multiple nodes. If y
 $ make MPI=1 MPI_HOME=/path/to/mpi CUDA_HOME=/path/to/cuda NCCL_HOME=/path/to/nccl
 ```
 
+In some distributions, MPI's header files may not reside in `$MPI_HOME/include`. In this case, you can set `MPI_INCLUDE` to the path where MPI's header files are installed. 
+
+```shell
+$ make MPI=1 MPI_HOME=/path/to/mpi MPI_INCLUDE=/path/to/mpi/headers CUDA_HOME=/path/to/cuda NCCL_HOME=/path/to/nccl
+```
+
 You can also add a suffix to the name of the generated binaries with `NAME_SUFFIX`. For example when compiling with the MPI versions you could use:
 
 ```shell
