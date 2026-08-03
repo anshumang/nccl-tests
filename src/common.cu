@@ -618,7 +618,7 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   }
   if (args->nGpus > 1) NCCLCHECK(ncclGroupEnd());
 
-  if (blocking_coll) {
+  if (blocking_coll && blocking_coll != 3) {
     // Complete op before returning
     TESTCHECK(testStreamSynchronize(args->nGpus, args->streams, args->comms));
   }
@@ -627,7 +627,7 @@ testResult_t startColl(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
 }
 
 testResult_t completeColl(struct threadArgs* args) {
-  if (blocking_coll && agg_iters <= 1) return testSuccess;
+  if (blocking_coll && blocking_coll != 3 && agg_iters <= 1) return testSuccess;
 
   TESTCHECK(testStreamSynchronize(args->nGpus, args->streams, args->comms));
   return testSuccess;
@@ -773,8 +773,8 @@ testResult_t BenchTime(struct threadArgs* args, ncclDataType_t type, ncclRedOp_t
   if (cudaGraphLaunches >= 1) deltaSec = deltaSec/cudaGraphLaunches;
 
   if (record) {
-    // completeColl skips the stream sync in blocking mode with a single aggregated iteration.
-    if (blocking_coll && agg_iters <= 1)
+    // completeColl skips the stream sync for blocking modes 1 and 2 with a single aggregated iteration.
+    if (blocking_coll && blocking_coll != 3 && agg_iters <= 1)
       TESTCHECK(testStreamSynchronize(args->nGpus, args->streams, args->comms));
     TESTCHECK(getElapsedTimes(args, iters, agg_iters));
     TESTCHECK(destroyEvents(args, iters));
